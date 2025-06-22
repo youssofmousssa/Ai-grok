@@ -9,3 +9,4 @@ Pillow==10.3.0
 rich==13.7.1
 openai==1.30.3
 yt-dlp
+ffmpeg-python
