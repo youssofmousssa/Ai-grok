@@ -1,4 +1,10 @@
 python-telegram-bot==20.7
-openai
-rich
-requests
+pytube==15.0.0
+pydub==0.25.1
+SpeechRecognition==3.10.0
+requests==2.31.0
+aiohttp==3.9.5
+python-dotenv==1.0.1
+Pillow==10.3.0
+rich==13.7.1
+openai==1.30.3
