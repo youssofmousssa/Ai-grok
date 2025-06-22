@@ -1,17 +1,15 @@
 user:
   name: youssof
-  github: youssofmousssa
+  github: youssofmoussa
 
 language: "python"
 python_version: "3.11"
 
 commands:
   build:
-    - "pip install -r requirements.txt"
+    - pip install -r requirements.txt
   start:
-    - "python3 ai.py"
+    - python3 bot.py
 
 env:
-  - "TELEGRAM_TOKEN=7430894063:AAHb4psK9x9K0tAHyP5DeD5HqOa_uwZ1g1A"
-  - "GROQ_API_KEY=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"
-  - "GROQ_API_BASE_URL=https://api.groq.com/openai/v1"
+  - TELEGRAM_TOKEN=7567951774:AAEeyDqHnaC7uuPUvw_wAoW6WF9iZ0pO_NE
