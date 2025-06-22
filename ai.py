@@ -1,16 +1,17 @@
 import os
 import logging
+import asyncio
+import re
+import threading
+from uuid import uuid4
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     CallbackContext, CallbackQueryHandler
 )
-from pytube import YouTube
+import yt_dlp
 from pydub import AudioSegment
 import speech_recognition as sr
-import threading
-from uuid import uuid4
-import re
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 # Initialize recognizer
 recognizer = sr.Recognizer()
+
+# Audio download options
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'wav',
+        'preferredquality': '192',
+    }],
+    'outtmpl': 'audio_%(id)s.%(ext)s',
+    'quiet': True,
+    'no_warnings': True,
+    'extract_flat': True
+}
 
 class TranscriptionBot:
     def __init__(self):
@@ -156,11 +171,11 @@ class TranscriptionBot:
         elif query.data == 'about':
             await query.edit_message_text(
                 "🤖 *About YouTube Transcriber*\n\n"
-                "إصدار: 2.1\n"
+                "إصدار: 2.2\n"
                 "المطور: @YourUsername\n\n"
                 "هذا البوت يستخدم:\n"
                 "- Python 3.12\n"
-                "- pytube لتحميل الفيديوهات\n"
+                "- yt-dlp لتحميل الفيديوهات\n"
                 "- Google Speech Recognition\n",
                 parse_mode='Markdown'
             )
@@ -209,29 +224,37 @@ class TranscriptionBot:
         thread.start()
 
     def extract_youtube_url(self, text: str) -> str:
-        """Extract YouTube URL from text"""
+        """Extract YouTube URL from text with proper regex"""
         # Check for command with URL
         if text.startswith('/transcribe'):
             parts = text.split()
             if len(parts) > 1:
                 url = parts[1]
-                if "youtube.com" in url or "youtu.be" in url:
+                if self.is_valid_youtube_url(url):
                     return url
                 return None
         
         # Check if it's a plain URL
+        if self.is_valid_youtube_url(text):
+            return text
+        
+        return None
+
+    def is_valid_youtube_url(self, url: str) -> bool:
+        """Validate YouTube URL with robust regex"""
         youtube_regex = (
             r'(https?://)?(www\.)?'
-            '(youtube|youtu|youtube-nocookie)\.(com|be)/'
-            '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
+            r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
+            r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
         
-        match = re.match(youtube_regex, text)
-        return text if match else None
+        return re.match(youtube_regex, url) is not None
 
     def run_async_process_video(self, update: Update, context: CallbackContext, url: str, job_id: str):
         """Wrapper to run async function in a thread"""
-        import asyncio
-        asyncio.run(self.process_video(update, context, url, job_id))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self.process_video(update, context, url, job_id))
+        loop.close()
 
     async def update_status(self, context: CallbackContext, job_id: str, status: str, progress: int) -> None:
         """Update the status message"""
@@ -264,6 +287,22 @@ class TranscriptionBot:
         except Exception as e:
             logger.error(f"Error updating status: {e}")
 
+    async def download_audio(self, url: str, job_id: str) -> tuple:
+        """Download audio using yt-dlp with error handling"""
+        try:
+            ydl_opts['outtmpl'] = f'audio_{job_id}.%(ext)s'
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                audio_file = f"audio_{job_id}.wav"
+                title = info.get('title', 'Unknown Title')
+                duration = info.get('duration', 0)
+                
+            return audio_file, title, duration, None
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            return None, None, None, str(e)
+
     async def process_video(self, update: Update, context: CallbackContext, url: str, job_id: str) -> None:
         """Process the YouTube video"""
         try:
@@ -271,44 +310,28 @@ class TranscriptionBot:
             
             # Step 1: Download audio
             await self.update_status(context, job_id, 'downloading', 10)
-            try:
-                yt = YouTube(url)
-                audio_stream = yt.streams.filter(only_audio=True).first()
-                audio_file = f"audio_{job_id}.mp4"
-                audio_stream.download(filename=audio_file)
-            except Exception as e:
+            audio_file, title, duration, error = await self.download_audio(url, job_id)
+            
+            if error:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"❌ فشل تحميل الفيديو: {str(e)}\n"
-                         f"❌ Failed to download video: {str(e)}"
+                    text=f"❌ فشل تحميل الفيديو: {error}\n"
+                         f"❌ Failed to download video: {error}"
                 )
                 del self.active_transcriptions[job_id]
                 return
             
-            # Step 2: Convert to WAV
-            await self.update_status(context, job_id, 'converting', 30)
-            try:
-                wav_file = f"audio_{job_id}.wav"
-                audio = AudioSegment.from_file(audio_file)
-                audio.export(wav_file, format="wav")
-                os.remove(audio_file)
-            except Exception as e:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ فشل تحويل الصوت: {str(e)}\n"
-                         f"❌ Failed to convert audio: {str(e)}"
-                )
-                del self.active_transcriptions[job_id]
-                return
-            
-            # Step 3: Transcribe
+            # Step 2: Transcribe
             await self.update_status(context, job_id, 'transcribing', 60)
             try:
-                with sr.AudioFile(wav_file) as source:
+                with sr.AudioFile(audio_file) as source:
                     audio_data = recognizer.record(source)
                     language = context.user_data.get('language', 'en-US')
                     transcript = recognizer.recognize_google(audio_data, language=language)
-                os.remove(wav_file)
+                
+                # Clean up audio file
+                if os.path.exists(audio_file):
+                    os.remove(audio_file)
             except sr.UnknownValueError:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -326,7 +349,7 @@ class TranscriptionBot:
                 del self.active_transcriptions[job_id]
                 return
             
-            # Step 4: Format and send results
+            # Step 3: Format and send results
             await self.update_status(context, job_id, 'formatting', 90)
             
             formatted_transcript = self.format_transcript(transcript, context.user_data.get('language', 'en-US'))
@@ -343,11 +366,13 @@ class TranscriptionBot:
                 [InlineKeyboardButton("📥 Download as TXT", callback_data=f'download_{job_id}')]
             ]
             
+            duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
+            
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"✅ *اكتمل التحويل!*\n\n"
-                     f"📺 *عنوان الفيديو:* {yt.title}\n"
-                     f"⏱ *المدة:* {yt.length // 60}:{yt.length % 60:02d}\n\n"
+                     f"📺 *عنوان الفيديو:* {title}\n"
+                     f"⏱ *المدة:* {duration_str}\n\n"
                      f"📝 *النص:*\n\n"
                      f"{formatted_transcript[:3000]}...",
                 reply_markup=InlineKeyboardMarkup(keyboard),
@@ -356,7 +381,7 @@ class TranscriptionBot:
             
             # Store full transcript for download
             self.active_transcriptions[job_id]['transcript'] = formatted_transcript
-            self.active_transcriptions[job_id]['video_title'] = yt.title
+            self.active_transcriptions[job_id]['video_title'] = title
             
         except Exception as e:
             logger.error(f"Error in processing thread: {e}")
@@ -385,5 +410,8 @@ class TranscriptionBot:
         logger.info("Bot is running...")
 
 if __name__ == '__main__':
+    # Install required packages if not already installed
+    required_packages = ['python-telegram-bot', 'yt-dlp', 'pydub', 'SpeechRecognition', 'ffmpeg-python']
+    
     bot = TranscriptionBot()
     bot.run()
